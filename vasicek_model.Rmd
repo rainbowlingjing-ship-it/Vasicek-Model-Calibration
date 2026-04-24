@@ -1,0 +1,436 @@
+---
+title: "Vasicek Model Calibration and Validation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+
+
+Vasicek Model Calibration and Validation in R
+
+This script:
+1. Simulates historical portfolio default data under a
+   Vasicek one-factor credit risk model
+2. Calibrates model parameters (PD and asset correlation)
+   using maximum likelihood estimation
+3. Performs parameter stability analysis
+4. Performs sensitivity testing
+5. Simulates correlated defaults and portfolio loss dynamics
+6. Documents model assumptions and limitations
+
+
+
+```{r}
+rm(list = ls())
+set.seed(123)
+```
+
+
+
+
+**1. Helper functions**
+
+```{r}
+# Conditional default probability under Vasicek one-factor model
+# p(z) = Phi((Phi^{-1}(pd) - sqrt(rho)*z) / sqrt(1-rho))
+conditional_pd <- function(z, pd, rho) {
+  q <- qnorm(pd)
+  pnorm((q - sqrt(rho) * z) / sqrt(1 - rho))
+}
+
+```
+
+```{r}
+# Simulate default counts across multiple periods
+simulate_default_history <- function(T_periods, n_obligors, pd, rho) {
+  Z <- rnorm(T_periods)  # systematic factor for each period
+  default_counts <- numeric(T_periods)
+  default_rates  <- numeric(T_periods)
+  
+  for (t in 1:T_periods) {
+    p_t <- conditional_pd(Z[t], pd, rho)
+    defaults_t <- rbinom(1, size = n_obligors, prob = p_t)
+    default_counts[t] <- defaults_t
+    default_rates[t]  <- defaults_t / n_obligors
+  }
+  
+  data.frame(
+    period = 1:T_periods,
+    Z = Z,
+    default_count = default_counts,
+    default_rate = default_rates
+  )
+}
+```
+
+
+```{r}
+# Negative log-likelihood for observed default counts
+# We integrate over the latent systematic factor Z ~ N(0,1)
+negloglik_vasicek <- function(param, default_counts, n_obligors) {
+  pd  <- param[1]
+  rho <- param[2]
+  
+  # parameter constraints
+  if (pd <= 0.0001 || pd >= 0.30 || rho <= 0.0001 || rho >= 0.999) {
+    return(1e10)
+  }
+  
+  # marginal likelihood for each period:
+  # L_t = integral Binomial(k_t | n, p(z)) * phi(z) dz
+  # approximate with numerical integration
+  ll_vec <- numeric(length(default_counts))
+  
+  for (t in seq_along(default_counts)) {
+    k_t <- default_counts[t]
+    
+    integrand <- function(z) {
+      p_t <- conditional_pd(z, pd, rho)
+      dbinom(k_t, size = n_obligors, prob = p_t) * dnorm(z)
+    }
+    
+    val <- try(
+      integrate(integrand, lower = -8, upper = 8, subdivisions = 1000L)$value,
+      silent = TRUE
+    )
+    
+    if (inherits(val, "try-error") || is.na(val) || val <= 0) {
+      return(1e10)
+    }
+    
+    ll_vec[t] <- log(val)
+  }
+  
+  return(-sum(ll_vec))
+}
+
+```
+
+
+```{r}
+# Calibrate PD and rho by MLE
+fit_vasicek_mle <- function(default_counts, n_obligors,
+                            init_pd = 0.03, init_rho = 0.10) {
+  fit <- optim(
+    par = c(init_pd, init_rho),
+    fn = negloglik_vasicek,
+    default_counts = default_counts,
+    n_obligors = n_obligors,
+    method = "L-BFGS-B",
+    lower = c(0.0001, 0.0001),
+    upper = c(0.30, 0.999)
+  )
+  
+  list(
+    fit = fit,
+    pd_hat = fit$par[1],
+    rho_hat = fit$par[2],
+    negloglik = fit$value,
+    convergence = fit$convergence
+  )
+}
+```
+
+
+
+```{r}
+# Simulate portfolio-level correlated defaults using estimated parameters
+simulate_portfolio_loss <- function(n_scenarios, n_obligors, pd, rho,
+                                    ead = 100, lgd = 0.45) {
+  default_threshold <- qnorm(pd)
+  default_matrix <- matrix(0, nrow = n_scenarios, ncol = n_obligors)
+  
+  Z <- rnorm(n_scenarios)
+  
+  for (s in 1:n_scenarios) {
+    epsilon <- rnorm(n_obligors)
+    asset_return <- sqrt(rho) * Z[s] + sqrt(1 - rho) * epsilon
+    default_matrix[s, ] <- ifelse(asset_return < default_threshold, 1, 0)
+  }
+  
+  portfolio_default_rate <- rowMeans(default_matrix)
+  portfolio_loss <- rowSums(default_matrix * ead * lgd)
+  
+  list(
+    default_matrix = default_matrix,
+    portfolio_default_rate = portfolio_default_rate,
+    portfolio_loss = portfolio_loss
+  )
+}
+```
+
+
+
+
+
+
+
+**2. Simulate "historical" default data**
+```{r}
+# True model parameters
+pd_true  <- 0.03
+rho_true <- 0.15
+
+# Historical panel setup
+T_periods  <- 40      # e.g., 40 quarterly observations
+n_obligors <- 500     # portfolio size per period
+
+history_data <- simulate_default_history(
+  T_periods = T_periods,
+  n_obligors = n_obligors,
+  pd = pd_true,
+  rho = rho_true
+)
+
+cat("==== Simulated Historical Default Data (first 10 rows) ====\n")
+print(head(history_data, 10))
+
+```
+
+
+
+
+
+
+**3. Maximum likelihood calibration**
+```{r}
+mle_result <- fit_vasicek_mle(
+  default_counts = history_data$default_count,
+  n_obligors = n_obligors,
+  init_pd = 0.02,
+  init_rho = 0.10
+)
+
+cat("\n==== MLE Calibration Results ====\n")
+cat("Convergence code:", mle_result$convergence, "\n")
+cat("Estimated PD :", round(mle_result$pd_hat, 6), "\n")
+cat("Estimated rho:", round(mle_result$rho_hat, 6), "\n")
+cat("Negative log-likelihood:", round(mle_result$negloglik, 4), "\n")
+
+comparison_table <- data.frame(
+  Parameter = c("PD", "rho"),
+  True = c(pd_true, rho_true),
+  Estimated = c(mle_result$pd_hat, mle_result$rho_hat),
+  Error = c(mle_result$pd_hat - pd_true, mle_result$rho_hat - rho_true)
+)
+
+cat("\n==== Parameter Recovery Check ====\n")
+print(comparison_table)
+```
+
+
+
+
+
+
+
+**4. Parameter stability analysis**
+
+```{r}
+# Split the time series into two subsamples
+split_point <- floor(T_periods / 2)
+
+hist_1 <- history_data$default_count[1:split_point]
+hist_2 <- history_data$default_count[(split_point + 1):T_periods]
+
+mle_1 <- fit_vasicek_mle(hist_1, n_obligors, init_pd = 0.02, init_rho = 0.10)
+mle_2 <- fit_vasicek_mle(hist_2, n_obligors, init_pd = 0.02, init_rho = 0.10)
+
+stability_table <- data.frame(
+  Parameter = c("PD", "rho"),
+  Full_Sample = c(mle_result$pd_hat, mle_result$rho_hat),
+  First_Half = c(mle_1$pd_hat, mle_1$rho_hat),
+  Second_Half = c(mle_2$pd_hat, mle_2$rho_hat)
+)
+
+cat("\n==== Parameter Stability Analysis ====\n")
+print(stability_table)
+```
+
+
+
+
+**5. Sensitivity testing**
+```{r}
+# Sensitivity of log-likelihood to rho around calibrated estimate
+rho_grid <- seq(max(0.01, mle_result$rho_hat - 0.08),
+                min(0.50, mle_result$rho_hat + 0.08),
+                by = 0.02)
+
+sensitivity_results <- data.frame(
+  rho = rho_grid,
+  NegLogLik = NA_real_
+)
+
+for (i in seq_along(rho_grid)) {
+  test_param <- c(mle_result$pd_hat, rho_grid[i])
+  sensitivity_results$NegLogLik[i] <- negloglik_vasicek(
+    test_param,
+    default_counts = history_data$default_count,
+    n_obligors = n_obligors
+  )
+}
+
+cat("\n==== Sensitivity Testing (rho) ====\n")
+print(sensitivity_results)
+```
+
+
+
+
+
+
+**6. Simulate correlated default structures**
+```{r}
+portfolio_sim <- simulate_portfolio_loss(
+  n_scenarios = 5000,
+  n_obligors = 1000,
+  pd = mle_result$pd_hat,
+  rho = mle_result$rho_hat,
+  ead = 100,
+  lgd = 0.45
+)
+
+cat("\n==== Portfolio Default Rate Summary ====\n")
+print(summary(portfolio_sim$portfolio_default_rate))
+
+cat("\n==== Portfolio Loss Summary ====\n")
+print(summary(portfolio_sim$portfolio_loss))
+
+# Approximate pairwise default correlation
+sample_cols <- 1:20
+corr_mat <- cor(portfolio_sim$default_matrix[, sample_cols])
+pairwise_corr <- corr_mat[upper.tri(corr_mat)]
+
+cat("\n==== Approximate Pairwise Default Correlation ====\n")
+print(mean(pairwise_corr, na.rm = TRUE))
+```
+
+
+
+**7. Stress / scenario analysis**
+```{r}
+stress_Z <- c(-2, -1, 0, 1, 2)
+
+stress_table <- data.frame(
+  Systematic_Factor = stress_Z,
+  Conditional_PD = NA_real_
+)
+
+for (i in seq_along(stress_Z)) {
+  stress_table$Conditional_PD[i] <- conditional_pd(
+    z = stress_Z[i],
+    pd = mle_result$pd_hat,
+    rho = mle_result$rho_hat
+  )
+}
+
+cat("\n==== Conditional PD under Stress Scenarios ====\n")
+print(stress_table)
+
+```
+
+
+
+
+**8. Basic risk metrics**
+```{r}
+loss_var_95 <- quantile(portfolio_sim$portfolio_loss, 0.95)
+loss_var_99 <- quantile(portfolio_sim$portfolio_loss, 0.99)
+
+cat("\n==== Portfolio Loss Risk Metrics ====\n")
+cat("VaR 95%:", round(loss_var_95, 2), "\n")
+cat("VaR 99%:", round(loss_var_99, 2), "\n")
+```
+
+
+
+
+
+**9.Plots**
+```{r}
+
+
+plot(
+  history_data$period, history_data$default_rate,
+  type = "b",
+  main = "Historical Default Rates",
+  xlab = "Period",
+  ylab = "Default Rate"
+)
+
+plot(
+  sensitivity_results$rho, sensitivity_results$NegLogLik,
+  type = "b",
+  main = "Sensitivity of NegLogLik to rho",
+  xlab = "rho",
+  ylab = "Negative Log-Likelihood"
+)
+
+hist(
+  portfolio_sim$portfolio_default_rate,
+  breaks = 40,
+  main = "Portfolio Default Rate Distribution",
+  xlab = "Default Rate"
+)
+
+hist(
+  portfolio_sim$portfolio_loss,
+  breaks = 40,
+  main = "Portfolio Loss Distribution",
+  xlab = "Portfolio Loss"
+)
+
+
+```
+
+
+
+
+
+**10. Assumptions and limitations**
+```{r}
+cat("\n==== Model Assumptions and Limitations ====\n")
+cat("Assumptions:\n")
+cat("- Homogeneous portfolio: same PD, same EAD, same LGD, same correlation.\n")
+cat("- One-factor dependence structure through a single systematic risk factor.\n")
+cat("- Conditional defaults are independent given the systematic factor.\n")
+cat("- Historical periods are treated as independent draws of the systematic factor.\n\n")
+
+cat("Limitations:\n")
+cat("- This is a simplified portfolio credit model and does not include rating migration.\n")
+cat("- LGD and EAD are assumed fixed rather than stochastic.\n")
+cat("- The model does not include macroeconomic covariates or IFRS 9 lifetime ECL framework.\n")
+cat("- Numerical integration is used for MLE and may be computationally expensive for larger datasets.\n")
+
+```
+
+
+
+
+
+
